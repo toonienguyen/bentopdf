@@ -1284,4 +1284,3 @@ BentoPDF wouldn't be possible without the amazing open-source tools and librarie
 > AGPL-licensed libraries are not bundled in BentoPDF's source code. They are loaded at runtime from CDN (pre-configured) and can be overridden via environment variables or Advanced Settings.
 
 Your work inspires and empowers developers everywhere. Thank you for making open-source amazing!
-
