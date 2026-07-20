@@ -20,6 +20,31 @@ export interface LoadProgress {
 
 export type ProgressCallback = (progress: LoadProgress) => void;
 
+// Cross-Origin-Embedder-Policy (required on this site for
+// self.crossOriginIsolated / SharedArrayBuffer) blocks `new Worker(url)`
+// when `url` is cross-origin -- even when the response carries a correct
+// Cross-Origin-Resource-Policy header. This is a stricter, separate check
+// from ordinary CORS/fetch and is often called the "framed resource"
+// restriction. A plain fetch() to the same URL is NOT blocked by it.
+//
+// The workaround: fetch the script ourselves (same-origin fetch is exempt),
+// wrap the bytes in a Blob, and hand `new Worker()` a `blob:` URL instead of
+// the original cross-origin one. `blob:` URLs are always treated as
+// same-origin to the page that created them, so the framed-resource check
+// never triggers. This does not touch the 3 data files that load via
+// fetch()/locateFile() (soffice.wasm.gz, soffice.data.gz,
+// soffice.worker.js) -- only scripts passed to `new Worker()` need this.
+async function fetchAsBlobUrl(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch worker script for blob conversion: ${url} (status ${response.status})`
+    );
+  }
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}
+
 // Singleton for converter instance
 let converterInstance: LibreOfficeConverter | null = null;
 
@@ -28,6 +53,11 @@ export class LibreOfficeConverter {
   private initialized = false;
   private initializing = false;
   private basePath: string;
+  // Blob URLs created for cross-origin worker scripts (see initialize()).
+  // Kept here so destroy() can revoke them; must NOT be revoked earlier,
+  // since Emscripten's pthread runtime keeps reusing the soffice.js blob URL
+  // for every new worker thread it spawns throughout the converter's life.
+  private createdBlobUrls: string[] = [];
 
   constructor(basePath?: string) {
     this.basePath = basePath || LIBREOFFICE_LOCAL_PATH;
@@ -53,12 +83,24 @@ export class LibreOfficeConverter {
         message: 'Loading conversion engine...',
       });
 
+      // sofficeJs and browserWorkerJs are both passed to `new Worker()`
+      // internally (by @matbee/libreoffice-converter, and by Emscripten's
+      // pthread runtime reusing sofficeJs for each worker thread it spawns).
+      // Convert both to same-origin blob: URLs first -- see fetchAsBlobUrl()
+      // for why. The other 3 files (wasm/data/worker-loader) are fetched
+      // normally via locateFile() and don't need this treatment.
+      const [sofficeJsBlobUrl, browserWorkerJsBlobUrl] = await Promise.all([
+        fetchAsBlobUrl(`${this.basePath}soffice.js`),
+        fetchAsBlobUrl(`${this.basePath}browser.worker.global.js`),
+      ]);
+      this.createdBlobUrls.push(sofficeJsBlobUrl, browserWorkerJsBlobUrl);
+
       this.converter = new WorkerBrowserConverter({
-        sofficeJs: `${this.basePath}soffice.js`,
+        sofficeJs: sofficeJsBlobUrl,
         sofficeWasm: `${this.basePath}soffice.wasm.gz`,
         sofficeData: `${this.basePath}soffice.data.gz`,
         sofficeWorkerJs: `${this.basePath}soffice.worker.js`,
-        browserWorkerJs: `${this.basePath}browser.worker.global.js`,
+        browserWorkerJs: browserWorkerJsBlobUrl,
         verbose: false,
         onProgress: (info: {
           phase: string;
@@ -171,6 +213,14 @@ export class LibreOfficeConverter {
     }
     this.converter = null;
     this.initialized = false;
+
+    // Safe to revoke now that the converter (and every pthread worker it
+    // spawned, which kept reusing the soffice.js blob URL) is fully torn
+    // down. Revoking any earlier would break in-flight worker creation.
+    for (const url of this.createdBlobUrls) {
+      URL.revokeObjectURL(url);
+    }
+    this.createdBlobUrls = [];
   }
 }
 
